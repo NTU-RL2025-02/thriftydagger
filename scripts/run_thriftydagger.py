@@ -152,8 +152,8 @@ if __name__ == '__main__':
 	input_device = Keyboard(env, pos_sensitivity=0.5, rot_sensitivity=3.0)
 	if render:
 		env.viewer.add_keypress_callback(input_device.on_press)
-		env.viewer.add_keyup_callback(input_device.on_release)
-		env.viewer.add_keyrepeat_callback(input_device.on_press)
+		# env.viewer.add_keyup_callback(input_device.on_release)
+		# env.viewer.add_keyrepeat_callback(input_device.on_press)
 	active_robot = env.robots[arm_ == 'left']
 
 	def hg_dagger_wait():
