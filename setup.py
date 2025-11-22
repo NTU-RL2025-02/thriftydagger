@@ -29,7 +29,8 @@ setup(
         'robosuite',
         'h5py',
         'hidapi',
-        'pygame'
+        'pygame', 
+        'robosuite_models'
     ],
     description="Code for ThriftyDAgger.",
     author="Ryan Hoque",

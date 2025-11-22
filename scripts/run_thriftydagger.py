@@ -2,10 +2,11 @@
 from thrifty.algos.thriftydagger import thrifty, generate_offline_data
 from thrifty.algos.lazydagger import lazy
 from thrifty.utils.run_utils import setup_logger_kwargs
-import gym, torch
+import gymnasium as gym
+import torch
 import robosuite as suite
-from robosuite.controllers.composite.composite_controller_factory import load_controller_config
-from robosuite.utils.input_utils import input2action
+from robosuite.controllers import load_composite_controller_config
+from robosuite.devices.mjgui import MJGUI
 from thrifty.utils.hardcoded_nut_assembly import HardcodedPolicy
 from robosuite.wrappers import VisualizationWrapper
 from robosuite.wrappers import GymWrapper
@@ -82,16 +83,40 @@ if __name__ == '__main__':
 
 	logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 	# setup env ...
-	controller_config = load_controller_config(default_controller='OSC_POSE')
 	config = {
 		"env_name": args.environment,
 		"robots": "UR5e",
-		"controller_configs": controller_config,
+		"controller_configs": {
+			'type': 'BASIC', 
+			'body_parts': {
+				'right': {
+					'type': 'OSC_POSE', 
+					'input_max': 1, 
+					'input_min': -1, 
+					'output_max': [0.05, 0.05, 0.05, 0.5, 0.5, 0.5], 
+					'output_min': [-0.05, -0.05, -0.05, -0.5, -0.5, -0.5], 
+					'kp': 150, 
+					'damping_ratio': 1, 
+					'impedance_mode': 'fixed', 
+					'kp_limits': [0, 300], 
+					'damping_ratio_limits': [0, 10], 
+					'position_limits': None, 
+					'orientation_limits': None, 
+					'uncouple_pos_ori': True, 
+					'input_type': 'delta', 
+					'input_ref_frame': 
+					'base', 'interpolation': None, 
+					'ramp_ratio': 0.2, 
+					'gripper': {'type': 'GRIP'}
+				}
+			}
+		}
 	}
 
 	if args.environment == 'NutAssembly':
 		env = suite.make(
 			**config,
+			gripper_types="default",
 			has_renderer=render,
 			has_offscreen_renderer=False,
 			render_camera="agentview",
@@ -120,20 +145,21 @@ if __name__ == '__main__':
 	env = GymWrapper(env)
 	env = VisualizationWrapper(env, indicator_configs=None)
 	env = CustomWrapper(env, render=render)
+	print(env.observation_space)
 
 	arm_ = 'right'
 	config_ = 'single-arm-opposed'
-	input_device = Keyboard(pos_sensitivity=0.5, rot_sensitivity=3.0)
+	input_device = Keyboard(env, pos_sensitivity=0.5, rot_sensitivity=3.0)
 	if render:
-		env.viewer.add_keypress_callback("any", input_device.on_press)
-		env.viewer.add_keyup_callback("any", input_device.on_release)
-		env.viewer.add_keyrepeat_callback("any", input_device.on_press)
+		env.viewer.add_keypress_callback(input_device.on_press)
+		env.viewer.add_keyup_callback(input_device.on_release)
+		env.viewer.add_keyrepeat_callback(input_device.on_press)
 	active_robot = env.robots[arm_ == 'left']
 
 	def hg_dagger_wait():
 		# for HG-dagger, repurpose the 'Z' key (action elem 3) for starting/ending interaction
 		for _ in range(10):
-			a, _ = input2action(
+			a, _ = MJGUI.input2action(
 				device=input_device,
 				robot=active_robot,
 				active_arm=arm_,
@@ -155,7 +181,7 @@ if __name__ == '__main__':
 		a_ref = a.copy()
 		# pause simulation if there is no user input (instead of recording a no-op)
 		while np.array_equal(a, a_ref):
-			a, _ = input2action(
+			a, _ = MJGUI.input2action(
 				device=input_device,
 				robot=active_robot,
 				active_arm=arm_,
@@ -163,7 +189,6 @@ if __name__ == '__main__':
 			env.render()
 			time.sleep(0.001)
 		return a
-
 	robosuite_cfg = {'MAX_EP_LEN': 175, 'INPUT_DEVICE': input_device}
 	if args.algo_sup:
 		expert_pol = HardcodedPolicy(env).act

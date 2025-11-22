@@ -145,10 +145,33 @@ class Logger:
             logger = EpochLogger(**logger_kwargs)
             logger.save_config(locals())
         """
+        if not isinstance(config, dict):
+            config = {"config": config}
+
+        filtered = {}
+        for k, v in config.items():
+            # Skip private stuff and modules
+            if k.startswith("_"):
+                continue
+            # Skip the logger itself (self) to avoid cycles
+            if isinstance(v, Logger):
+                continue
+            # Skip PyTorch modules (huge, and not "config")
+            if isinstance(v, torch.nn.Module):
+                continue
+            # You can add more filters here if needed
+            filtered[k] = v
+        
         config_json = convert_json(config)
         if self.exp_name is not None:
             config_json['exp_name'] = self.exp_name
-        output = json.dumps(config_json, separators=(',',':\t'), indent=4, sort_keys=True)
+            
+        output = json.dumps(
+            config_json, 
+            separators = (',',':\t'), 
+            indent=4, 
+            sort_keys=True
+        )
         print(colorize('Saving config:\n', color='cyan', bold=True))
         print(output)
         with open(osp.join(self.output_dir, "config.json"), 'w') as out:
