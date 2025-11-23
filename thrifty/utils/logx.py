@@ -186,7 +186,7 @@ class Logger:
             config_json["exp_name"] = self.exp_name
 
         output = json.dumps(
-            config_json, separators=(",", ":\t"), indent=4, sort_keys=True
+            config_json, separators=(",", ":\t"), indent=4, sort_keys=False
         )
         print(colorize("Saving config:\n", color="cyan", bold=True))
         print(output)

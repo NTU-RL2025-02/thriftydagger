@@ -255,7 +255,11 @@ def thrifty(
     logger = EpochLogger(**logger_kwargs)
     _locals = locals()
     del _locals["env"]
-    logger.save_config(_locals)
+    try:
+        logger.save_config(_locals)
+    except TypeError as e:
+        print(f"[Warning] Could not save config as JSON: {e}")
+    
     if device_idx >= 0:
         device = torch.device("cuda", device_idx)
     else:
