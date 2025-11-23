@@ -32,12 +32,18 @@ class CustomWrapper(gymnasium.Env):
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = -1
+        ret = None
         for _ in range(10):
-            r = self.env.step(settle_action)
-            print(r)
+            ret = self.env.step(settle_action)
+            # normalize to (obs, reward, done, info) if Gymnasium returns 5-tuple
+            if isinstance(ret, (tuple, list)) and len(ret) == 5:
+                o, rew, term, trunc, info = ret
+                ret = (o, rew, bool(term or trunc), info)
+            # keep rendering
             self.render()
         self.gripper_closed = False
-        return r
+        # return the (possibly normalized) last step result so callers can unwrap obs
+        return ret
 
     def step(self, action):
         # abstract 10 actions as 1 action
@@ -49,9 +55,21 @@ class CustomWrapper(gymnasium.Env):
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = action[-1]
+        ret = None
         for _ in range(10):
-            r1, r2, r3, r4 = self.env.step(settle_action)
+            ret = self.env.step(settle_action)
+            # normalize 5-tuple -> 4-tuple (obs, reward, done, info)
+            if isinstance(ret, (tuple, list)) and len(ret) == 5:
+                o, rew, term, trunc, info = ret
+                ret = (o, rew, bool(term or trunc), info)
             self.render()
+        # set gripper flag
+        if action[-1] > 0:
+            self.gripper_closed = True
+        else:
+            self.gripper_closed = False
+        # unpack normalized return
+        r1, r2, r3, r4 = ret
         if action[-1] > 0:
             self.gripper_closed = True
         else:

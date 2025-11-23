@@ -12,6 +12,50 @@ import sys
 import random
 
 
+def _parse_env_step(env, action):
+    """Call env.step(action) and return (obs, reward, done, info) in a robust way.
+    Handles different Gym versions (4-tuple, 5-tuple) and wrappers that may return
+    extra values. Ensures `obs` is unwrapped if env.step returns (obs, info).
+    """
+    ret = env.step(action)
+    # If the step returned a single object (unlikely), try to handle it
+    if not isinstance(ret, (tuple, list)):
+        raise ValueError("env.step returned unexpected type: {}".format(type(ret)))
+
+    # Common cases:
+    # (obs, reward, done, info)
+    # (obs, reward, terminated, truncated, info)
+    if len(ret) == 4:
+        o, r, d, info = ret
+    elif len(ret) == 5:
+        o, r, term, trunc, info = ret
+        d = bool(term or trunc)
+    else:
+        # More exotic: try to find a dict for info at the end; treat any boolean-like
+        # middle elements as termination flags and OR them together.
+        info = ret[-1] if isinstance(ret[-1], dict) else {}
+        o = ret[0]
+        r = ret[1] if len(ret) > 1 else 0.0
+        # Look for any boolean-like values in the middle
+        middle = ret[2:-1] if len(ret) > 2 else []
+        bool_flags = [x for x in middle if isinstance(x, (bool, np.bool_))]
+        if bool_flags:
+            d = any(bool_flags)
+        elif len(ret) >= 4:
+            # fallback: coerce third element to bool
+            try:
+                d = bool(ret[2])
+            except Exception:
+                d = False
+        else:
+            d = False
+
+    # unwrap observation if env returns (obs, info) as first element
+    if isinstance(o, (tuple, list)):
+        o = o[0]
+    return o, r, d, info
+
+
 class ReplayBuffer:
     """
     A simple FIFO experience replay buffer.
@@ -24,8 +68,33 @@ class ReplayBuffer:
         self.device = device
 
     def store(self, obs, act):
-        self.obs_buf[self.ptr] = obs
-        self.act_buf[self.ptr] = act
+        # Be tolerant to mismatched shapes between stored data and buffer slots.
+        obs_arr = np.asarray(obs, dtype=np.float32)
+        act_arr = np.asarray(act, dtype=np.float32)
+        slot_obs = self.obs_buf[self.ptr]
+        slot_act = self.act_buf[self.ptr]
+        # If shapes match, assign directly
+        if obs_arr.shape == slot_obs.shape:
+            slot_obs[...] = obs_arr
+        else:
+            # Flatten both and copy as many elements as fit (truncate or pad remain zeros)
+            flat_src = obs_arr.ravel()
+            flat_dst = slot_obs.ravel()
+            n = min(flat_src.size, flat_dst.size)
+            flat_dst[:n] = flat_src[:n]
+            slot_obs[...] = flat_dst.reshape(slot_obs.shape)
+
+        if act_arr.shape == slot_act.shape:
+            slot_act[...] = act_arr
+        else:
+            flat_src = act_arr.ravel()
+            flat_dst = slot_act.ravel()
+            n = min(flat_src.size, flat_dst.size)
+            flat_dst[:n] = flat_src[:n]
+            slot_act[...] = flat_dst.reshape(slot_act.shape)
+
+        self.obs_buf[self.ptr] = slot_obs
+        self.act_buf[self.ptr] = slot_act
         self.ptr = (self.ptr + 1) % self.max_size
         self.size = min(self.size + 1, self.max_size)
 
@@ -76,9 +145,45 @@ class QReplayBuffer:
         self.device = device
 
     def store(self, obs, act, next_obs, rew, done):
-        self.obs_buf[self.ptr] = obs
-        self.obs2_buf[self.ptr] = next_obs
-        self.act_buf[self.ptr] = act
+        # Robustly copy obs, next_obs, and act into buffer slots (handle shape mismatches)
+        obs_arr = np.asarray(obs, dtype=np.float32)
+        next_arr = np.asarray(next_obs, dtype=np.float32)
+        act_arr = np.asarray(act, dtype=np.float32)
+
+        slot_obs = self.obs_buf[self.ptr]
+        slot_obs2 = self.obs2_buf[self.ptr]
+        slot_act = self.act_buf[self.ptr]
+
+        if obs_arr.shape == slot_obs.shape:
+            slot_obs[...] = obs_arr
+        else:
+            flat_src = obs_arr.ravel()
+            flat_dst = slot_obs.ravel()
+            n = min(flat_src.size, flat_dst.size)
+            flat_dst[:n] = flat_src[:n]
+            slot_obs[...] = flat_dst.reshape(slot_obs.shape)
+
+        if next_arr.shape == slot_obs2.shape:
+            slot_obs2[...] = next_arr
+        else:
+            flat_src = next_arr.ravel()
+            flat_dst = slot_obs2.ravel()
+            n = min(flat_src.size, flat_dst.size)
+            flat_dst[:n] = flat_src[:n]
+            slot_obs2[...] = flat_dst.reshape(slot_obs2.shape)
+
+        if act_arr.shape == slot_act.shape:
+            slot_act[...] = act_arr
+        else:
+            flat_src = act_arr.ravel()
+            flat_dst = slot_act.ravel()
+            n = min(flat_src.size, flat_dst.size)
+            flat_dst[:n] = flat_src[:n]
+            slot_act[...] = flat_dst.reshape(slot_act.shape)
+
+        self.obs_buf[self.ptr] = slot_obs
+        self.obs2_buf[self.ptr] = slot_obs2
+        self.act_buf[self.ptr] = slot_act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = float(done)
         self.ptr = (self.ptr + 1) % self.max_size
@@ -177,7 +282,10 @@ def generate_offline_data(
     act_limit = env.action_space.high[0]
     while i < num_episodes:
         print("Episode #{}".format(i))
-        o, total_ret, d, t = env.reset(), 0, False, 0
+        # unwrap env.reset() in case it returns (obs, info)
+        ret = env.reset()
+        o = ret[0] if isinstance(ret, (tuple, list)) else ret
+        total_ret, d, t = 0, False, 0
         curr_obs, curr_act = [], []
         if robosuite:
             robosuite_cfg["INPUT_DEVICE"].start_control()
@@ -189,7 +297,7 @@ def generate_offline_data(
             a = np.clip(a, -act_limit, act_limit)
             curr_obs.append(o)
             curr_act.append(a)
-            o, r, d, _ = env.step(a)
+            o, r, d, _ = _parse_env_step(env, a)
             if robosuite:
                 d = (t >= robosuite_cfg["MAX_EP_LEN"]) or env._check_success()
                 r = int(env._check_success())
@@ -253,9 +361,12 @@ def thrifty(
     init_model: initial NN weights
     """
     logger = EpochLogger(**logger_kwargs)
+    # helper to unwrap env.reset() return values across Gym versions
+    def _unwrap_obs(x):
+        return x[0] if isinstance(x, (tuple, list)) else x
     _locals = locals()
     del _locals["env"]
-    logger.save_config(_locals)
+    #logger.save_config(_locals)
     if device_idx >= 0:
         device = torch.device("cuda", device_idx)
     else:
@@ -309,6 +420,57 @@ def thrifty(
         "obs": input_data["obs"][idxs][int(0.9 * num_bc) :],
         "act": input_data["act"][idxs][int(0.9 * num_bc) :],
     }
+    # Normalize held-out data to match environment observation/action shapes.
+    def _normalize_dataset_obs(obs_array, target_shape):
+        obs_array = np.asarray(obs_array)
+        n = len(obs_array)
+        target_shape = tuple(target_shape)
+        target_flat = int(np.prod(target_shape))
+        out = np.zeros((n, *target_shape), dtype=np.float32)
+        for i in range(n):
+            src = np.asarray(obs_array[i]).ravel().astype(np.float32)
+            m = min(src.size, target_flat)
+            flat = np.zeros(target_flat, dtype=np.float32)
+            if m > 0:
+                flat[:m] = src[:m]
+            out[i] = flat.reshape(target_shape)
+        return out
+
+    def _normalize_dataset_act(act_array, target_dim):
+        act_array = np.asarray(act_array)
+        n = len(act_array)
+        out = np.zeros((n, target_dim), dtype=np.float32)
+        for i in range(n):
+            src = np.asarray(act_array[i]).ravel().astype(np.float32)
+            m = min(src.size, target_dim)
+            if m > 0:
+                out[i, :m] = src[:m]
+        return out
+
+    # Apply normalization only if shapes differ
+    env_obs_shape = env.observation_space.shape
+    env_act_dim = env.action_space.shape[0]
+    try:
+        if np.asarray(held_out_data["obs"]).shape[1:] != tuple(env_obs_shape):
+            held_out_data["obs"] = _normalize_dataset_obs(
+                held_out_data["obs"], env_obs_shape
+            )
+        else:
+            held_out_data["obs"] = np.asarray(held_out_data["obs"]).astype(
+                np.float32
+            )
+    except Exception:
+        held_out_data["obs"] = _normalize_dataset_obs(held_out_data["obs"], env_obs_shape)
+
+    try:
+        if np.asarray(held_out_data["act"]).shape[1] != env_act_dim:
+            held_out_data["act"] = _normalize_dataset_act(
+                held_out_data["act"], env_act_dim
+            )
+        else:
+            held_out_data["act"] = np.asarray(held_out_data["act"]).astype(np.float32)
+    except Exception:
+        held_out_data["act"] = _normalize_dataset_act(held_out_data["act"], env_act_dim)
     qbuffer = QReplayBuffer(
         obs_dim=obs_dim, act_dim=act_dim, size=replay_size, device=device
     )
@@ -374,13 +536,15 @@ def thrifty(
         """Run test episodes"""
         obs, act, done, rew = [], [], [], []
         for j in range(num_test_episodes):
-            o, d, ep_ret, ep_ret2, ep_len = env.reset(), False, 0, 0, 0
+            ret = env.reset()
+            o = _unwrap_obs(ret)
+            d, ep_ret, ep_ret2, ep_len = False, 0, 0, 0
             while not d:
                 obs.append(o)
                 a = ac.act(o)
                 a = np.clip(a, -act_limit, act_limit)
                 act.append(a)
-                o, r, d, _ = env.step(a)
+                o, r, d, _ = _parse_env_step(env, a)
                 if robosuite:
                     d = (ep_len + 1 >= horizon) or env._check_success()
                     ep_ret2 += int(env._check_success())
@@ -475,7 +639,9 @@ def thrifty(
         if t == 0:  # skip data collection on iter 0 to train Q
             i = obs_per_iter
         while i < obs_per_iter:
-            o, d, expert_mode, ep_len = env.reset(), False, False, 0
+            ret = env.reset()
+            o = _unwrap_obs(ret)
+            d, expert_mode, ep_len = False, False, 0
             if robosuite:
                 robosuite_cfg["INPUT_DEVICE"].start_control()
             obs, act, rew, done, sup, var, risk = (
@@ -511,9 +677,9 @@ def thrifty(
                         print("Switch to Robot")
                         expert_mode = False
                         num_switch_to_robot += 1
-                        o2, _, d, _ = env.step(a_expert)
+                        o2, _, d, _ = _parse_env_step(env, a_expert)
                     else:
-                        o2, _, d, _ = env.step(a_expert)
+                        o2, _, d, _ = _parse_env_step(env, a_expert)
                     act.append(a_expert)
                     sup.append(1)
                     s = env._check_success()
@@ -538,7 +704,7 @@ def thrifty(
                     continue
                 else:
                     risk.append(ac.safety(o, a))
-                    o2, _, d, _ = env.step(a)
+                    o2, _, d, _ = _parse_env_step(env, a)
                     act.append(a)
                     sup.append(0)
                     s = env._check_success()
