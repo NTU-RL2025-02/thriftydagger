@@ -329,7 +329,7 @@ if __name__ == "__main__":
             target_rate=args.targetrate,
             seed=args.seed,
             expert_policy=expert_pol,
-            input_file="robosuite-30.pkl",
+            input_file="rollout.pkl",
             robosuite=True,
             robosuite_cfg=robosuite_cfg,
             q_learning=True,

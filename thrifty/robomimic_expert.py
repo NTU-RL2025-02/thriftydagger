@@ -125,10 +125,11 @@ class RobomimicExpert:
                     "could not retrieve raw observation dict from environment wrapper"
                 )
 
-        eef_pos      = obs[0:3]     # (3,)
-        eef_quat     = obs[3:7]     # (4,)
-        gripper_qpos = obs[7:9]     # (2,)
-        obj          = obs[9:23]    # (14,)
+
+        obj = obs[0, 0:14]  
+        eef_pos      = obs[0, 14:17]     # (3,)
+        eef_quat     = obs[0, 17:21]     # (4,)
+        gripper_qpos = obs[0, 21:23]     # (2,)
 
         # robomimic expects this flat structure (not nested under "obs")
         obs_dict = {
