@@ -15,9 +15,43 @@ import numpy as np
 import sys
 import time
 
+from thrifty.robomimic_expert import RobomimicExpert
+
+# 這裡用你搬到比較短路徑的 expert model
+# 路徑是相對於你執行 python 的地方（目前你是在 thriftydagger/scripts 底下跑）
+expert_pol = RobomimicExpert(
+    "expert_model/model_epoch_200_low_dim_v15_success_0.1.pth",
+    device="cuda" if torch.cuda.is_available() else "cpu",
+)
+
+class ObsCachingWrapper:
+    """
+    Lightweight wrapper that caches raw robosuite dict observations.
+    Not a Gymnasium wrapper because the base robosuite env is not a Gym Env.
+    """
+    def __init__(self, env):
+        self.env = env
+        self.latest_obs_dict = None
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        self.latest_obs_dict = obs
+        return obs
+
+    def step(self, action):
+        result = self.env.step(action)
+        if isinstance(result, tuple) and len(result) == 5:
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+        else:
+            obs, reward, done, info = result
+        self.latest_obs_dict = obs
+        return obs, reward, done, info
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
 
 class CustomWrapper(gymnasium.Env):
-
     def __init__(self, env, render):
         self.env = env
         self.observation_space = env.observation_space
@@ -27,23 +61,30 @@ class CustomWrapper(gymnasium.Env):
         self.robots = env.robots
         self._render = render
 
+    def _step(self, action):
+        """
+        Normalize step outputs to (obs, reward, done, info) even if the base env
+        follows the Gymnasium API and returns terminated/truncated separately.
+        """
+        result = self.env.step(action)
+        if isinstance(result, tuple) and len(result) == 5:
+            obs, reward, terminated, truncated, info = result
+            done = terminated or truncated
+            return obs, reward, done, info
+        return result
+
     def reset(self):
-        r = self.env.reset()
+        res = self.env.reset()      # o ?O obs ?V?q (23,)
+        o = res[0] if isinstance(res, tuple) else res
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = -1
-        ret = None
         for _ in range(10):
-            ret = self.env.step(settle_action)
-            # normalize to (obs, reward, done, info) if Gymnasium returns 5-tuple
-            if isinstance(ret, (tuple, list)) and len(ret) == 5:
-                o, rew, term, trunc, info = ret
-                ret = (o, rew, bool(term or trunc), info)
-            # keep rendering
+            o, r, d, info = self._step(settle_action)
+            # print(o, r, d, info)  # ?u???n debug ?A?L
             self.render()
         self.gripper_closed = False
-        # return the (possibly normalized) last step result so callers can unwrap obs
-        return ret
+        return o
 
     def step(self, action):
         # abstract 10 actions as 1 action
@@ -51,25 +92,13 @@ class CustomWrapper(gymnasium.Env):
         action_ = action.copy()
         action_[3] = 0.0
         action_[4] = 0.0
-        self.env.step(action_)
+        self._step(action_)
         self.render()
         settle_action = np.zeros(7)
         settle_action[-1] = action[-1]
-        ret = None
         for _ in range(10):
-            ret = self.env.step(settle_action)
-            # normalize 5-tuple -> 4-tuple (obs, reward, done, info)
-            if isinstance(ret, (tuple, list)) and len(ret) == 5:
-                o, rew, term, trunc, info = ret
-                ret = (o, rew, bool(term or trunc), info)
+            r1, r2, r3, r4 = self._step(settle_action)
             self.render()
-        # set gripper flag
-        if action[-1] > 0:
-            self.gripper_closed = True
-        else:
-            self.gripper_closed = False
-        # unpack normalized return
-        r1, r2, r3, r4 = ret
         if action[-1] > 0:
             self.gripper_closed = True
         else:
@@ -102,6 +131,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--targetrate", type=float, default=0.01, help="target context switching rate"
     )
+    # 你可以下 --environment Square，就會自動用 NutAssemblySquare + Panda
     parser.add_argument("--environment", type=str, default="NutAssembly")
     parser.add_argument("--no_render", action="store_true")
     parser.add_argument("--hgdagger", action="store_true")
@@ -119,10 +149,21 @@ if __name__ == "__main__":
     render = not args.no_render
 
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
-    # setup env ...
+
+    # ---- 決定 robosuite env 名字 & 機器人型號 ----
+    if args.environment == "Square":
+        # 我們的 Square 任務，其實是 robosuite 的 NutAssemblySquare，用 Panda
+        robosuite_env_name = "NutAssemblySquare"
+        robots = "Panda"
+    else:
+        # 其他情況就直接用 args.environment
+        robosuite_env_name = args.environment
+        robots = "UR5e"
+
+    # 共用的 config
     config = {
-        "env_name": args.environment,
-        "robots": "UR5e",
+        "env_name": robosuite_env_name,
+        "robots": robots,
         "controller_configs": {
             "type": "BASIC",
             "body_parts": {
@@ -150,36 +191,33 @@ if __name__ == "__main__":
         },
     }
 
-    if args.environment == "NutAssembly":
-        env = suite.make(
-            **config,
-            gripper_types="default",
-            has_renderer=render,
-            has_offscreen_renderer=False,
-            render_camera="agentview",
-            single_object_mode=2,  # env has 1 nut instead of 2
-            nut_type="round",
-            ignore_done=True,
-            use_camera_obs=False,
-            reward_shaping=True,
-            control_freq=20,
-            hard_reset=True,
-            use_object_obs=True
-        )
-    else:
-        env = suite.make(
-            **config,
-            has_renderer=render,
-            has_offscreen_renderer=False,
-            render_camera="agentview",
-            ignore_done=True,
-            use_camera_obs=False,
-            reward_shaping=True,
-            control_freq=20,
-            hard_reset=True,
-            use_object_obs=True
-        )
-    env = GymWrapper(env)
+    # 建立 robosuite 環境
+    env = suite.make(
+        **config,
+        has_renderer=render,
+        has_offscreen_renderer=False,
+        render_camera="agentview",
+        ignore_done=True,
+        use_camera_obs=False,  # low_dim expert，不用影像
+        reward_shaping=True,
+        control_freq=20,
+        hard_reset=True,
+        use_object_obs=True,
+    )
+
+    obs_cacher = ObsCachingWrapper(env)
+    if isinstance(expert_pol, RobomimicExpert):
+        print("Binding environment wrapper to RobomimicExpert...")
+        expert_pol.set_env(obs_cacher)
+    env = GymWrapper(
+        obs_cacher,     
+        keys=[
+            "robot0_eef_pos",
+            "robot0_eef_quat",
+            "robot0_gripper_qpos",
+            "object",
+        ],
+    )
     env = VisualizationWrapper(env, indicator_configs=None)
     env = CustomWrapper(env, render=render)
 
@@ -207,7 +245,7 @@ if __name__ == "__main__":
                 break
         return a[3] != 0
 
-    def expert_pol(o):
+    def human_expert_pol(o):
         a = np.zeros(7)
         if env.gripper_closed:
             a[-1] = 1.0
@@ -233,8 +271,14 @@ if __name__ == "__main__":
         return a
 
     robosuite_cfg = {"MAX_EP_LEN": 175, "INPUT_DEVICE": input_device}
+
+    # 根據參數決定要用哪一種 expert
     if args.algo_sup:
         expert_pol = HardcodedPolicy(env).act
+    elif args.hgdagger:
+        expert_pol = human_expert_pol
+    # 否則就用一開始載進來的 robomimic expert_pol
+
     if args.gen_data:
         NUM_BC_EPISODES = 30
         generate_offline_data(
@@ -246,6 +290,7 @@ if __name__ == "__main__":
             robosuite=True,
             robosuite_cfg=robosuite_cfg,
         )
+
     if args.hgdagger:
         thrifty(
             env,
@@ -284,7 +329,7 @@ if __name__ == "__main__":
             target_rate=args.targetrate,
             seed=args.seed,
             expert_policy=expert_pol,
-            input_file="robosuite-30.pkl",
+            input_file="rollout.pkl",
             robosuite=True,
             robosuite_cfg=robosuite_cfg,
             q_learning=True,
